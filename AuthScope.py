@@ -1,4 +1,3 @@
-
 import os
 import json
 import time
@@ -6,6 +5,7 @@ import hashlib
 import platform
 from pathlib import Path
 from datetime import datetime, timezone
+from typing import Optional, Dict, Any
 
 import requests
 import win32security
@@ -14,6 +14,144 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.serialization import load_pem_public_key
 from cryptography.exceptions import InvalidSignature
+
+
+# ========== CONTINUITY HELPERS ==========
+class _continuity:
+    """Manages proof-of-continuity for device authentication chains"""
+    
+    def __init__(self, app_id: str):
+        self.app_id = app_id
+        self.cache_dir = Path.home() / ".authscope_continuity"
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        # Store continuity for all devices (identifier|hwid combinations)
+        self.cache_file = self.cache_dir / f"{app_id}_continuity.json"
+    
+    def _make_device_key(self, identifier: str, hwid: str) -> str:
+        """Create unique key for device (identifier + hwid)"""
+        return f"{identifier}|{hwid}"
+    
+    def get_stored_hashes(self) -> Dict[str, Dict[str, Any]]:
+        """Load all stored continuity hashes for all devices"""
+        if not self.cache_file.exists():
+            return {}
+        
+        try:
+            with open(self.cache_file, "r") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            return {}
+    
+    def save_hashes(self, continuity_data: Dict[str, Dict[str, Any]]):
+        """Save all continuity hashes"""
+        try:
+            with open(self.cache_file, "w") as f:
+                json.dump(continuity_data, f)
+        except IOError as e:
+            print(f"Warning: Could not save continuity data: {e}")
+    
+    def get_hash_for_device(self, identifier: str, hwid: str) -> Optional[Dict[str, Any]]:
+        """Get continuity hash for a specific device (identifier + hwid)"""
+        device_key = self._make_device_key(identifier, hwid)
+        data = self.get_stored_hashes()
+        return data.get(device_key)
+    
+    def compute_hash(self, prev_hash: str, timestamp: int, hwid: str) -> str:
+        """
+        Compute continuity hash: SHA256(prev_hash | timestamp | hwid)
+        """
+        payload = f"{prev_hash}|{timestamp}|{hwid}"
+        return hashlib.sha256(payload.encode()).hexdigest()
+    
+    def generate_continuity(self, identifier: str, hwid: str) -> Dict[str, Any]:
+        """
+        Generate continuity proof for a device authentication.
+        Each device (identifier + hwid combination) maintains independent chain.
+        Returns dict with timestamp and continuity_hash.
+        """
+        current_time = int(time.time())
+        stored = self.get_hash_for_device(identifier, hwid)
+        
+        # Bootstrap: first validation for this device
+        if stored is None or stored.get("hash") is None:
+            # For bootstrap, use a deterministic hash based on identifier and hwid only
+            prev_hash = hashlib.sha256(
+                f"bootstrap|{identifier}|{hwid}".encode()
+            ).hexdigest()
+        else:
+            prev_hash = stored["hash"]
+        
+        # Compute new hash
+        new_hash = self.compute_hash(prev_hash, current_time, hwid)
+        
+        return {
+            "identifier": identifier,
+            "hwid": hwid,
+            "timestamp": current_time,
+            "continuity_hash": new_hash,
+            "prev_hash": prev_hash,
+            "_new_hash": new_hash  # Will be stored after successful auth
+        }
+    
+    def mark_authenticated(self, identifier: str, continuity_data: Dict[str, Any]):
+        """
+        Called after successful authentication to persist the device continuity hash.
+        """
+        current_time = int(time.time())
+        hwid = continuity_data.get("hwid")
+        device_key = self._make_device_key(identifier, hwid)
+        all_data = self.get_stored_hashes()
+        
+        # Store the hash that was just used for authentication
+        all_data[device_key] = {
+            "hash": continuity_data["continuity_hash"],
+            "timestamp": current_time,
+            "last_auth": current_time,
+            "identifier": identifier,
+            "hwid": hwid
+        }
+        
+        self.save_hashes(all_data)
+    
+    def update_last_auth(self, identifier: str, hwid: str):
+        """Update the last authentication timestamp for a device"""
+        device_key = self._make_device_key(identifier, hwid)
+        all_data = self.get_stored_hashes()
+        if device_key in all_data:
+            all_data[device_key]["last_auth"] = int(time.time())
+            self.save_hashes(all_data)
+    
+    def clear_user(self, identifier: str, hwid: Optional[str] = None):
+        """
+        Clear continuity data for a specific device.
+        If hwid is None, clears all devices for this identifier.
+        """
+        all_data = self.get_stored_hashes()
+        
+        if hwid:
+            # Clear specific device
+            device_key = self._make_device_key(identifier, hwid)
+            if device_key in all_data:
+                del all_data[device_key]
+        else:
+            # Clear all devices for this identifier
+            keys_to_delete = [k for k in all_data.keys() if k.startswith(f"{identifier}|")]
+            for key in keys_to_delete:
+                del all_data[key]
+        
+        self.save_hashes(all_data)
+    
+    def clear_all(self):
+        """Clear all continuity data"""
+        if self.cache_file.exists():
+            try:
+                self.cache_file.unlink()
+            except IOError:
+                pass
+    
+    def get_all_users(self) -> Dict[str, Dict[str, Any]]:
+        """Get information about all devices with continuity data"""
+        return self.get_stored_hashes()
 
 
 class others:
@@ -85,6 +223,8 @@ class AuthClient:
     sessionid = None
     initialized = False
     offline_mode = False
+    continuity = None  # Will be initialized once
+    current_identifier = None  # Track current user/key
 
     class user_data_class:
         def __init__(self):
@@ -110,6 +250,9 @@ class AuthClient:
         self.cache = _offline(
             Path.home() / ".authscope_cache" / f"{appID}.json"
         )
+        
+        # Initialize continuity manager for multiple users
+        self.continuity = _continuity(appID)
 
         self.init()
 
@@ -206,6 +349,13 @@ class AuthClient:
 
         self.__apply_user(self.__normalize_user(data))
         self.offline_mode = True
+        
+        # Set current identifier for offline mode
+        if data.get("username"):
+            self.current_identifier = data.get("username")
+        elif data.get("license_key"):
+            self.current_identifier = data.get("license_key")
+        
         return data
 
     def init(self):
@@ -230,14 +380,25 @@ class AuthClient:
 
     def license(self, key):
         try:
+            hwid = others.get_hwid()
+            self.current_identifier = key
+            
+            # Generate continuity proof for this license key
+            continuity_data = self.continuity.generate_continuity(key, hwid)
+            
             data = self.__request(
                 "/license-login",
                 {
                     "license_key": key,
                     "session_token": self.sessionid,
-                    "hwid": others.get_hwid(),
+                    "hwid": hwid,
+                    "timestamp": continuity_data["timestamp"],
+                    "continuity_hash": continuity_data["continuity_hash"],
                 },
             )
+
+            # Mark continuity as authenticated after successful response
+            self.continuity.mark_authenticated(key, continuity_data)
 
             if "offline_login_data" in data:
                 self.cache.save(data["offline_login_data"])
@@ -259,15 +420,26 @@ class AuthClient:
 
     def user_login(self, username, password):
         try:
+            hwid = others.get_hwid()
+            self.current_identifier = username
+            
+            # Generate continuity proof for this username
+            continuity_data = self.continuity.generate_continuity(username, hwid)
+            
             data = self.__request(
                 "/user-login",
                 {
                     "username": username,
                     "password": password,
                     "session_token": self.sessionid,
-                    "hwid": others.get_hwid(),
+                    "hwid": hwid,
+                    "timestamp": continuity_data["timestamp"],
+                    "continuity_hash": continuity_data["continuity_hash"],
                 },
             )
+
+            # Mark continuity as authenticated after successful response
+            self.continuity.mark_authenticated(username, continuity_data)
 
             if "offline_login_data" in data:
                 self.cache.save(data["offline_login_data"])
@@ -321,11 +493,12 @@ class AuthClient:
 
     def validate_session(self):
         try:
+            hwid = others.get_hwid()
             data = self.__request(
                 "/validate-session",
                 {
                     "session_token": self.sessionid,
-                    "hwid": others.get_hwid(),
+                    "hwid": hwid,
                 },
             )
 
@@ -342,6 +515,10 @@ class AuthClient:
 
                 self.__apply_user(self.__normalize_user(merged))
                 print("Session is valid")
+                
+                # Update last auth timestamp for current device
+                if self.current_identifier:
+                    self.continuity.update_last_auth(self.current_identifier, hwid)
 
             return is_valid
 
@@ -389,15 +566,36 @@ class AuthClient:
         except requests.exceptions.ConnectionError:
             pass
 
+        # Clear continuity data for current device
+        if self.current_identifier:
+            hwid = others.get_hwid()
+            self.continuity.clear_user(self.current_identifier, hwid)
+        
         self.sessionid = None
         self.initialized = False
         self.offline_mode = False
+        self.current_identifier = None
 
         for k in vars(self.user_data):
             setattr(self.user_data, k, None)
 
         print("Logged out")
-
+    
+    def list_continuity_users(self):
+        """List all devices with continuity data"""
+        devices = self.continuity.get_all_users()
+        if not devices:
+            print("No continuity data found")
+            return
+        
+        print(f"\n--- Device Continuity Data ({len(devices)} devices) ---")
+        for device_key, data in devices.items():
+            last_auth = datetime.fromtimestamp(data["last_auth"]).strftime("%Y-%m-%d %H:%M:%S")
+            print(f"Device: {device_key}")
+            print(f"  Identifier: {data.get('identifier', 'N/A')}")
+            print(f"  HWID: {data.get('hwid', 'N/A')}")
+            print(f"  Last auth: {last_auth}")
+            print()
 
 
 def display_menu():
@@ -409,17 +607,15 @@ def display_menu():
     print("5. Validate Session")
     print("6. Upgrade Subscription")
     print("7. Logout")
-    print("8. Exit")
+    print("8. List Continuity Users")
+    print("9. Clear All Continuity Data")
+    print("10. Exit")
     return input("Choose option: ")
 
 
 def main():
     # Initialize the client
-    auth = AuthClient(
-        appID="your_app_id",
-        version="1.0.0",
-        publicKey="your_public_key_string",
-    )
+    auth = AuthClient()
     
     # Check offline mode
     if auth.offline_mode:
@@ -469,6 +665,7 @@ def main():
                 print(f"Created: {auth.user_data.created_at}")
                 print(f"Last Login: {auth.user_data.last_login}")
                 print(f"Offline Mode: {auth.offline_mode}")
+                print(f"Current Identifier: {auth.current_identifier}")
             
             elif choice == "5":
                 # Validate Session
@@ -494,6 +691,17 @@ def main():
                 print("✓ Logged out successfully!")
             
             elif choice == "8":
+                # List Continuity Users
+                auth.list_continuity_users()
+            
+            elif choice == "9":
+                # Clear All Continuity Data
+                confirm = input("Are you sure you want to clear ALL continuity data? (y/N): ")
+                if confirm.lower() == 'y':
+                    auth.continuity.clear_all()
+                    print("✓ All continuity data cleared!")
+            
+            elif choice == "10":
                 # Exit
                 auth.logout()
                 print("Goodbye!")
